@@ -1,0 +1,472 @@
+import argparse
+import time
+from collections import deque
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+
+HR_MIN_BPM = 45
+HR_MAX_BPM = 180
+MIN_DISPLAY_CONFIDENCE = 0.20
+DISPLAY_HOLD_SECONDS = 5.0
+DEFAULT_YUNET_MODEL = Path(__file__).resolve().parent / "models" / "face_detection_yunet_2022mar.onnx"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="CPU realtime rPPG demo using POS/CHROM.")
+    parser.add_argument("--camera", type=int, default=0, help="OpenCV camera index.")
+    parser.add_argument("--method", choices=["pos", "chrom"], default="pos")
+    parser.add_argument("--window", type=float, default=12.0, help="Signal window in seconds.")
+    parser.add_argument("--width", type=int, default=640, help="Camera capture width.")
+    parser.add_argument("--height", type=int, default=480, help="Camera capture height.")
+    parser.add_argument("--fps", type=int, default=30, help="Requested camera FPS.")
+    parser.add_argument("--detector", choices=["yunet", "haar"], default="yunet", help="Face detector backend.")
+    parser.add_argument("--yunet-model", default=str(DEFAULT_YUNET_MODEL), help="Path to YuNet ONNX model.")
+    parser.add_argument("--face-confidence", type=float, default=0.90, help="Minimum YuNet face confidence.")
+    return parser.parse_args()
+
+
+def bandpass_fft(signal, fs, low_hz=0.75, high_hz=3.0):
+    signal = np.asarray(signal, dtype=np.float64)
+    signal = signal - np.mean(signal)
+    if len(signal) < 8:
+        return signal
+
+    freqs = np.fft.rfftfreq(len(signal), d=1.0 / fs)
+    spec = np.fft.rfft(signal * np.hanning(len(signal)))
+    mask = (freqs >= low_hz) & (freqs <= high_hz)
+    spec[~mask] = 0
+    return np.fft.irfft(spec, n=len(signal))
+
+
+def uniform_resample(times, values, target_fs=30.0):
+    times = np.asarray(times, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    if len(times) < 2:
+        return values, target_fs
+
+    duration = times[-1] - times[0]
+    if duration <= 0:
+        return values, target_fs
+
+    n = max(8, int(duration * target_fs))
+    grid = np.linspace(times[0], times[-1], n)
+    out = np.empty((n, values.shape[1]), dtype=np.float64)
+    for i in range(values.shape[1]):
+        out[:, i] = np.interp(grid, times, values[:, i])
+    return out, target_fs
+
+
+def pos_signal(rgb):
+    c = np.asarray(rgb, dtype=np.float64)
+    c = c / (np.mean(c, axis=0, keepdims=True) + 1e-8) - 1.0
+    c = c.T
+    h = np.array([[0.0, 1.0, -1.0], [-2.0, 1.0, 1.0]]) @ c
+    std0 = np.std(h[0]) + 1e-8
+    std1 = np.std(h[1]) + 1e-8
+    return h[0] + (std0 / std1) * h[1]
+
+
+def chrom_signal(rgb):
+    c = np.asarray(rgb, dtype=np.float64)
+    c = c / (np.mean(c, axis=0, keepdims=True) + 1e-8) - 1.0
+    r, g, b = c[:, 0], c[:, 1], c[:, 2]
+    x = 3.0 * r - 2.0 * g
+    y = 1.5 * r + g - 1.5 * b
+    alpha = (np.std(x) + 1e-8) / (np.std(y) + 1e-8)
+    return x - alpha * y
+
+
+def estimate_hr(times, rgb, method):
+    if len(rgb) < 90:
+        return None, None, None, 0.0
+
+    samples, fs = uniform_resample(times, rgb, target_fs=30.0)
+    if len(samples) < 90:
+        return None, None, None, 0.0
+
+    raw = pos_signal(samples) if method == "pos" else chrom_signal(samples)
+    filtered = bandpass_fft(raw, fs, HR_MIN_BPM / 60.0, HR_MAX_BPM / 60.0)
+
+    freqs = np.fft.rfftfreq(len(filtered), d=1.0 / fs)
+    spec = np.abs(np.fft.rfft(filtered * np.hanning(len(filtered)))) ** 2
+    mask = (freqs >= HR_MIN_BPM / 60.0) & (freqs <= HR_MAX_BPM / 60.0)
+    if not np.any(mask):
+        return filtered, freqs, spec, 0.0
+
+    band_freqs = freqs[mask]
+    band_spec = spec[mask]
+    peak_idx = int(np.argmax(band_spec))
+    bpm = float(band_freqs[peak_idx] * 60.0)
+
+    peak_freq = band_freqs[peak_idx]
+    peak_mask = np.abs(band_freqs - peak_freq) <= 0.10
+    peak_power = float(np.sum(band_spec[peak_mask]))
+    noise_power = float(np.sum(band_spec[~peak_mask]) + 1e-8)
+    confidence = np.clip(peak_power / noise_power, 0.0, 5.0) / 5.0
+    return filtered, freqs, spec, bpm, float(confidence)
+
+
+def load_haar_detector():
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    detector = cv2.CascadeClassifier(cascade_path)
+    if detector.empty():
+        raise RuntimeError(f"Could not load Haar cascade: {cascade_path}")
+    return {"kind": "haar", "model": detector}
+
+
+def load_yunet_detector(model_path, frame_size, score_threshold):
+    if not hasattr(cv2, "FaceDetectorYN"):
+        raise RuntimeError("This OpenCV build does not include cv2.FaceDetectorYN.")
+    if not Path(model_path).exists():
+        raise RuntimeError(f"YuNet model not found: {model_path}")
+    detector = cv2.FaceDetectorYN.create(
+        str(model_path),
+        "",
+        frame_size,
+        score_threshold,
+        0.3,
+        5000,
+    )
+    return {"kind": "yunet", "model": detector, "frame_size": frame_size}
+
+
+def load_face_detector(kind, yunet_model, frame_size, face_confidence):
+    if kind == "haar":
+        return load_haar_detector()
+
+    try:
+        return load_yunet_detector(yunet_model, frame_size, face_confidence)
+    except RuntimeError as exc:
+        print(f"YuNet unavailable ({exc}); falling back to Haar.")
+        return load_haar_detector()
+
+
+def choose_face(faces, frame_shape):
+    if len(faces) == 0:
+        return None
+
+    h, w = frame_shape[:2]
+    center = np.array([w / 2.0, h / 2.0])
+
+    def score(face):
+        x, y, fw, fh = face
+        face_center = np.array([x + fw / 2.0, y + fh / 2.0])
+        return fw * fh - 0.25 * np.linalg.norm(face_center - center)
+
+    return tuple(max(faces, key=score))
+
+
+def clamp_face_box(face, frame_shape):
+    x, y, w, h = face
+    frame_h, frame_w = frame_shape[:2]
+    x1 = max(0, min(frame_w - 1, x))
+    y1 = max(0, min(frame_h - 1, y))
+    x2 = max(0, min(frame_w, x + w))
+    y2 = max(0, min(frame_h, y + h))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2 - x1, y2 - y1)
+
+
+def detect_face_yunet(frame, detector_state, previous):
+    frame_h, frame_w = frame.shape[:2]
+    frame_size = (frame_w, frame_h)
+    if detector_state.get("frame_size") != frame_size:
+        detector_state["model"].setInputSize(frame_size)
+        detector_state["frame_size"] = frame_size
+
+    _, faces = detector_state["model"].detect(frame)
+    if faces is None or len(faces) == 0:
+        return previous
+
+    boxes = []
+    for face in faces:
+        x, y, w, h = face[:4]
+        box = clamp_face_box((int(round(x)), int(round(y)), int(round(w)), int(round(h))), frame.shape)
+        if box is not None:
+            boxes.append(box)
+    return choose_face(boxes, frame.shape) or previous
+
+
+def detect_face_haar(gray, detector_state, previous):
+    faces = detector_state["model"].detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(90, 90))
+    return choose_face(faces, gray.shape) or previous
+
+
+def detect_face(frame, gray, detector_state, previous):
+    if detector_state["kind"] == "yunet":
+        try:
+            return detect_face_yunet(frame, detector_state, previous)
+        except cv2.error as exc:
+            print(f"YuNet detect failed ({exc}); switching to Haar.")
+            detector_state.clear()
+            detector_state.update(load_haar_detector())
+            return detect_face_haar(gray, detector_state, previous)
+    return detect_face_haar(gray, detector_state, previous)
+
+
+def smooth_face_box(previous, detected, alpha=0.25):
+    if detected is None:
+        return previous
+    if previous is None:
+        return tuple(int(v) for v in detected)
+
+    px, py, pw, ph = previous
+    dx, dy, dw, dh = detected
+    smoothed = (
+        alpha * dx + (1.0 - alpha) * px,
+        alpha * dy + (1.0 - alpha) * py,
+        alpha * dw + (1.0 - alpha) * pw,
+        alpha * dh + (1.0 - alpha) * ph,
+    )
+    return tuple(int(round(v)) for v in smoothed)
+
+
+def roi_mask_for_face(frame_shape, face):
+    mask = np.zeros(frame_shape[:2], dtype=np.uint8)
+    if face is None:
+        return mask, None
+
+    x, y, w, h = face
+    rects = [
+        (x + int(0.30 * w), y + int(0.12 * h), int(0.40 * w), int(0.16 * h)),
+        (x + int(0.18 * w), y + int(0.45 * h), int(0.25 * w), int(0.22 * h)),
+        (x + int(0.57 * w), y + int(0.45 * h), int(0.25 * w), int(0.22 * h)),
+    ]
+
+    clipped = []
+    fh, fw = frame_shape[:2]
+    for rx, ry, rw, rh in rects:
+        x1, y1 = max(0, rx), max(0, ry)
+        x2, y2 = min(fw, rx + rw), min(fh, ry + rh)
+        if x2 > x1 and y2 > y1:
+            mask[y1:y2, x1:x2] = 255
+            clipped.append((x1, y1, x2 - x1, y2 - y1))
+    return mask, clipped
+
+
+def mean_rgb(frame_bgr, mask):
+    pixels = frame_bgr[mask > 0]
+    if len(pixels) < 64:
+        return None
+    rgb = pixels[:, ::-1]
+    return np.mean(rgb, axis=0)
+
+
+def draw_plot(canvas, x, y, w, h, values, color, label, vline=None):
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), (45, 45, 45), 1)
+    cv2.putText(canvas, label, (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (210, 210, 210), 1)
+    if values is None or len(values) < 2:
+        return
+
+    vals = np.asarray(values, dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if len(vals) < 2:
+        return
+    vals = vals[-w:]
+    vmin, vmax = np.percentile(vals, [5, 95])
+    if abs(vmax - vmin) < 1e-8:
+        return
+    ys = y + h - np.clip((vals - vmin) / (vmax - vmin), 0, 1) * h
+    xs = np.linspace(x, x + w - 1, len(vals))
+    pts = np.column_stack([xs, ys]).astype(np.int32)
+    cv2.polylines(canvas, [pts], False, color, 2, cv2.LINE_AA)
+    if vline is not None:
+        vx = int(x + np.clip(vline, 0, 1) * w)
+        cv2.line(canvas, (vx, y), (vx, y + h), (150, 150, 150), 1)
+
+
+def draw_dashboard(frame, face, roi_rects, method, bpm, confidence, signal, freqs, spec, fps, window_seconds):
+    frame_h, frame_w = frame.shape[:2]
+    panel_w = 420
+    canvas_h = max(frame_h, 720)
+    canvas = np.zeros((canvas_h, frame_w + panel_w, 3), dtype=np.uint8)
+    canvas[:frame_h, :frame_w] = frame
+    panel_x = frame_w
+    canvas[:, panel_x:] = (24, 26, 29)
+
+    if face is not None:
+        x, y, w, h = face
+        cv2.rectangle(canvas, (x, y), (x + w, y + h), (60, 190, 120), 2)
+    if roi_rects:
+        for x, y, w, h in roi_rects:
+            cv2.rectangle(canvas, (x, y), (x + w, y + h), (90, 210, 250), 1)
+
+    px = panel_x + 24
+    cv2.putText(canvas, "CPU rPPG Demo", (px, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.82, (245, 245, 245), 2)
+    cv2.putText(canvas, f"Method: {method.upper()}", (px, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (190, 205, 220), 1)
+    cv2.putText(canvas, f"Camera FPS: {fps:4.1f}", (px, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (190, 205, 220), 1)
+    cv2.putText(canvas, f"Window: {window_seconds:4.1f}s", (px, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (190, 205, 220), 1)
+
+    bpm_text = "--" if bpm is None else f"{bpm:5.1f}"
+    cv2.putText(canvas, bpm_text, (px, 210), cv2.FONT_HERSHEY_SIMPLEX, 2.4, (80, 220, 140), 4)
+    cv2.putText(canvas, "BPM", (px + 230, 205), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (210, 210, 210), 2)
+
+    conf = 0.0 if confidence is None else confidence
+    conf_text = "--" if confidence is None else f"{confidence:0.2f}"
+    cv2.putText(
+        canvas,
+        f"Confidence: {conf_text}  min {MIN_DISPLAY_CONFIDENCE:0.2f}",
+        (px, 245),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (210, 210, 210),
+        1,
+    )
+    cv2.rectangle(canvas, (px, 260), (px + 240, 276), (70, 70, 70), 1)
+    cv2.rectangle(canvas, (px, 260), (px + int(240 * conf), 276), (80, 180, 120), -1)
+
+    plot_w = panel_w - 48
+    plot_h = 82
+    wave_y = 325
+    spec_y = wave_y + plot_h + 58
+    help_y = spec_y + plot_h + 44
+    draw_plot(canvas, px, wave_y, plot_w, plot_h, signal, (90, 210, 250), "rPPG waveform")
+
+    spectrum_values = None
+    peak_line = None
+    if freqs is not None and spec is not None:
+        mask = (freqs >= HR_MIN_BPM / 60.0) & (freqs <= HR_MAX_BPM / 60.0)
+        if np.any(mask):
+            spectrum_values = spec[mask]
+            if bpm is not None:
+                peak_hz = bpm / 60.0
+                peak_line = (peak_hz - HR_MIN_BPM / 60.0) / ((HR_MAX_BPM - HR_MIN_BPM) / 60.0)
+    draw_plot(canvas, px, spec_y, plot_w, plot_h, spectrum_values, (120, 170, 255), "spectrum", peak_line)
+
+    help_lines = [
+        "q quit    r reset",
+        "p POS     c CHROM",
+        "+/- window size",
+        "Keep face still and well lit.",
+    ]
+    for i, line in enumerate(help_lines):
+        cv2.putText(canvas, line, (px, help_y + i * 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (165, 170, 178), 1)
+
+    return canvas
+
+
+def main():
+    args = parse_args()
+    cap = cv2.VideoCapture(args.camera)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    cap.set(cv2.CAP_PROP_FPS, args.fps)
+
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera index {args.camera}")
+
+    detector = load_face_detector(
+        args.detector,
+        args.yunet_model,
+        (args.width, args.height),
+        args.face_confidence,
+    )
+
+    method = args.method
+    window_seconds = args.window
+    rgb_history = deque()
+    time_history = deque()
+    previous_face = None
+    displayed_face = None
+    last_detection = 0.0
+    last_t = time.perf_counter()
+    fps_smooth = 0.0
+    bpm = None
+    displayed_bpm = None
+    confidence = 0.0
+    displayed_confidence = None
+    last_reliable_bpm_time = 0.0
+    signal = None
+    freqs = None
+    spec = None
+    last_estimate = 0.0
+
+    cv2.namedWindow("CPU rPPG Demo", cv2.WINDOW_NORMAL)
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        now = time.perf_counter()
+        dt = max(1e-6, now - last_t)
+        last_t = now
+        fps_smooth = 0.9 * fps_smooth + 0.1 * (1.0 / dt) if fps_smooth else 1.0 / dt
+
+        frame = cv2.flip(frame, 1)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if now - last_detection > 0.35:
+            detected_face = detect_face(frame, gray, detector, previous_face)
+            previous_face = detected_face
+            last_detection = now
+        displayed_face = smooth_face_box(displayed_face, previous_face)
+
+        mask, roi_rects = roi_mask_for_face(frame.shape, displayed_face)
+        rgb = mean_rgb(frame, mask)
+        if rgb is not None:
+            rgb_history.append(rgb)
+            time_history.append(now)
+
+        while time_history and now - time_history[0] > window_seconds:
+            time_history.popleft()
+            rgb_history.popleft()
+
+        if len(rgb_history) >= 90 and now - last_estimate >= 0.35:
+            result = estimate_hr(np.array(time_history), np.array(rgb_history), method)
+            if len(result) == 5:
+                signal, freqs, spec, bpm, confidence = result
+                if bpm is not None and confidence >= MIN_DISPLAY_CONFIDENCE:
+                    displayed_bpm = bpm
+                    displayed_confidence = confidence
+                    last_reliable_bpm_time = now
+                elif now - last_reliable_bpm_time > DISPLAY_HOLD_SECONDS:
+                    displayed_bpm = None
+                    displayed_confidence = None
+                last_estimate = now
+
+        dashboard = draw_dashboard(
+            frame,
+            displayed_face,
+            roi_rects,
+            method,
+            displayed_bpm,
+            displayed_confidence,
+            signal,
+            freqs,
+            spec,
+            fps_smooth,
+            window_seconds,
+        )
+        cv2.imshow("CPU rPPG Demo", dashboard)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        if key == ord("p"):
+            method = "pos"
+        elif key == ord("c"):
+            method = "chrom"
+        elif key == ord("r"):
+            rgb_history.clear()
+            time_history.clear()
+            bpm = None
+            displayed_bpm = None
+            confidence = 0.0
+            displayed_confidence = None
+            last_reliable_bpm_time = 0.0
+            signal = freqs = spec = None
+        elif key in (ord("+"), ord("=")):
+            window_seconds = min(30.0, window_seconds + 1.0)
+        elif key in (ord("-"), ord("_")):
+            window_seconds = max(6.0, window_seconds - 1.0)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
