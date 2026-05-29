@@ -9,8 +9,14 @@ import numpy as np
 
 HR_MIN_BPM = 45
 HR_MAX_BPM = 180
+HR_MIN_HZ = HR_MIN_BPM / 60.0
+HR_MAX_HZ = HR_MAX_BPM / 60.0
 MIN_DISPLAY_CONFIDENCE = 0.20
 DISPLAY_HOLD_SECONDS = 5.0
+TARGET_FS = 30.0
+MIN_ESTIMATE_SAMPLES = 90
+DETECTION_INTERVAL_S = 0.35
+ESTIMATE_INTERVAL_S = 0.35
 DEFAULT_YUNET_MODEL = Path(__file__).resolve().parent / "models" / "face_detection_yunet_2022mar.onnx"
 
 
@@ -28,7 +34,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def bandpass_fft(signal, fs, low_hz=0.75, high_hz=3.0):
+def bandpass_fft(signal, fs, low_hz=HR_MIN_HZ, high_hz=HR_MAX_HZ):
     signal = np.asarray(signal, dtype=np.float64)
     signal = signal - np.mean(signal)
     if len(signal) < 8:
@@ -41,7 +47,7 @@ def bandpass_fft(signal, fs, low_hz=0.75, high_hz=3.0):
     return np.fft.irfft(spec, n=len(signal))
 
 
-def uniform_resample(times, values, target_fs=30.0):
+def uniform_resample(times, values, target_fs=TARGET_FS):
     times = np.asarray(times, dtype=np.float64)
     values = np.asarray(values, dtype=np.float64)
     if len(times) < 2:
@@ -59,10 +65,13 @@ def uniform_resample(times, values, target_fs=30.0):
     return out, target_fs
 
 
-def pos_signal(rgb):
+def normalize_rgb(rgb):
     c = np.asarray(rgb, dtype=np.float64)
-    c = c / (np.mean(c, axis=0, keepdims=True) + 1e-8) - 1.0
-    c = c.T
+    return c / (np.mean(c, axis=0, keepdims=True) + 1e-8) - 1.0
+
+
+def pos_signal(rgb):
+    c = normalize_rgb(rgb).T
     h = np.array([[0.0, 1.0, -1.0], [-2.0, 1.0, 1.0]]) @ c
     std0 = np.std(h[0]) + 1e-8
     std1 = np.std(h[1]) + 1e-8
@@ -70,8 +79,7 @@ def pos_signal(rgb):
 
 
 def chrom_signal(rgb):
-    c = np.asarray(rgb, dtype=np.float64)
-    c = c / (np.mean(c, axis=0, keepdims=True) + 1e-8) - 1.0
+    c = normalize_rgb(rgb)
     r, g, b = c[:, 0], c[:, 1], c[:, 2]
     x = 3.0 * r - 2.0 * g
     y = 1.5 * r + g - 1.5 * b
@@ -80,21 +88,21 @@ def chrom_signal(rgb):
 
 
 def estimate_hr(times, rgb, method):
-    if len(rgb) < 90:
-        return None, None, None, 0.0
+    if len(rgb) < MIN_ESTIMATE_SAMPLES:
+        return None, None, None, None, 0.0
 
-    samples, fs = uniform_resample(times, rgb, target_fs=30.0)
-    if len(samples) < 90:
-        return None, None, None, 0.0
+    samples, fs = uniform_resample(times, rgb, target_fs=TARGET_FS)
+    if len(samples) < MIN_ESTIMATE_SAMPLES:
+        return None, None, None, None, 0.0
 
     raw = pos_signal(samples) if method == "pos" else chrom_signal(samples)
-    filtered = bandpass_fft(raw, fs, HR_MIN_BPM / 60.0, HR_MAX_BPM / 60.0)
+    filtered = bandpass_fft(raw, fs, HR_MIN_HZ, HR_MAX_HZ)
 
     freqs = np.fft.rfftfreq(len(filtered), d=1.0 / fs)
     spec = np.abs(np.fft.rfft(filtered * np.hanning(len(filtered)))) ** 2
-    mask = (freqs >= HR_MIN_BPM / 60.0) & (freqs <= HR_MAX_BPM / 60.0)
+    mask = (freqs >= HR_MIN_HZ) & (freqs <= HR_MAX_HZ)
     if not np.any(mask):
-        return filtered, freqs, spec, 0.0
+        return filtered, freqs, spec, None, 0.0
 
     band_freqs = freqs[mask]
     band_spec = spec[mask]
@@ -191,12 +199,13 @@ def detect_face_yunet(frame, detector_state, previous):
     return choose_face(boxes, frame.shape) or previous
 
 
-def detect_face_haar(gray, detector_state, previous):
+def detect_face_haar(frame, detector_state, previous):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     faces = detector_state["model"].detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(90, 90))
     return choose_face(faces, gray.shape) or previous
 
 
-def detect_face(frame, gray, detector_state, previous):
+def detect_face(frame, detector_state, previous):
     if detector_state["kind"] == "yunet":
         try:
             return detect_face_yunet(frame, detector_state, previous)
@@ -204,8 +213,8 @@ def detect_face(frame, gray, detector_state, previous):
             print(f"YuNet detect failed ({exc}); switching to Haar.")
             detector_state.clear()
             detector_state.update(load_haar_detector())
-            return detect_face_haar(gray, detector_state, previous)
-    return detect_face_haar(gray, detector_state, previous)
+            return detect_face_haar(frame, detector_state, previous)
+    return detect_face_haar(frame, detector_state, previous)
 
 
 def smooth_face_box(previous, detected, alpha=0.25):
@@ -297,9 +306,13 @@ def draw_dashboard(frame, face, roi_rects, method, bpm, confidence, signal, freq
 
     px = panel_x + 24
     cv2.putText(canvas, "CPU rPPG Demo", (px, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.82, (245, 245, 245), 2)
-    cv2.putText(canvas, f"Method: {method.upper()}", (px, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (190, 205, 220), 1)
-    cv2.putText(canvas, f"Camera FPS: {fps:4.1f}", (px, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (190, 205, 220), 1)
-    cv2.putText(canvas, f"Window: {window_seconds:4.1f}s", (px, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (190, 205, 220), 1)
+    info_lines = [
+        f"Method: {method.upper()}",
+        f"Camera FPS: {fps:4.1f}",
+        f"Window: {window_seconds:4.1f}s",
+    ]
+    for i, line in enumerate(info_lines):
+        cv2.putText(canvas, line, (px, 78 + i * 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (190, 205, 220), 1)
 
     bpm_text = "--" if bpm is None else f"{bpm:5.1f}"
     cv2.putText(canvas, bpm_text, (px, 210), cv2.FONT_HERSHEY_SIMPLEX, 2.4, (80, 220, 140), 4)
@@ -329,12 +342,12 @@ def draw_dashboard(frame, face, roi_rects, method, bpm, confidence, signal, freq
     spectrum_values = None
     peak_line = None
     if freqs is not None and spec is not None:
-        mask = (freqs >= HR_MIN_BPM / 60.0) & (freqs <= HR_MAX_BPM / 60.0)
+        mask = (freqs >= HR_MIN_HZ) & (freqs <= HR_MAX_HZ)
         if np.any(mask):
             spectrum_values = spec[mask]
             if bpm is not None:
                 peak_hz = bpm / 60.0
-                peak_line = (peak_hz - HR_MIN_BPM / 60.0) / ((HR_MAX_BPM - HR_MIN_BPM) / 60.0)
+                peak_line = (peak_hz - HR_MIN_HZ) / (HR_MAX_HZ - HR_MIN_HZ)
     draw_plot(canvas, px, spec_y, plot_w, plot_h, spectrum_values, (120, 170, 255), "spectrum", peak_line)
 
     help_lines = [
@@ -375,9 +388,7 @@ def main():
     last_detection = 0.0
     last_t = time.perf_counter()
     fps_smooth = 0.0
-    bpm = None
     displayed_bpm = None
-    confidence = 0.0
     displayed_confidence = None
     last_reliable_bpm_time = 0.0
     signal = None
@@ -398,10 +409,8 @@ def main():
         fps_smooth = 0.9 * fps_smooth + 0.1 * (1.0 / dt) if fps_smooth else 1.0 / dt
 
         frame = cv2.flip(frame, 1)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if now - last_detection > 0.35:
-            detected_face = detect_face(frame, gray, detector, previous_face)
-            previous_face = detected_face
+        if now - last_detection > DETECTION_INTERVAL_S:
+            previous_face = detect_face(frame, detector, previous_face)
             last_detection = now
         displayed_face = smooth_face_box(displayed_face, previous_face)
 
@@ -415,18 +424,18 @@ def main():
             time_history.popleft()
             rgb_history.popleft()
 
-        if len(rgb_history) >= 90 and now - last_estimate >= 0.35:
-            result = estimate_hr(np.array(time_history), np.array(rgb_history), method)
-            if len(result) == 5:
-                signal, freqs, spec, bpm, confidence = result
-                if bpm is not None and confidence >= MIN_DISPLAY_CONFIDENCE:
-                    displayed_bpm = bpm
-                    displayed_confidence = confidence
-                    last_reliable_bpm_time = now
-                elif now - last_reliable_bpm_time > DISPLAY_HOLD_SECONDS:
-                    displayed_bpm = None
-                    displayed_confidence = None
-                last_estimate = now
+        if len(rgb_history) >= MIN_ESTIMATE_SAMPLES and now - last_estimate >= ESTIMATE_INTERVAL_S:
+            signal, freqs, spec, bpm, confidence = estimate_hr(
+                np.array(time_history), np.array(rgb_history), method
+            )
+            if bpm is not None and confidence >= MIN_DISPLAY_CONFIDENCE:
+                displayed_bpm = bpm
+                displayed_confidence = confidence
+                last_reliable_bpm_time = now
+            elif now - last_reliable_bpm_time > DISPLAY_HOLD_SECONDS:
+                displayed_bpm = None
+                displayed_confidence = None
+            last_estimate = now
 
         dashboard = draw_dashboard(
             frame,
@@ -453,9 +462,7 @@ def main():
         elif key == ord("r"):
             rgb_history.clear()
             time_history.clear()
-            bpm = None
             displayed_bpm = None
-            confidence = 0.0
             displayed_confidence = None
             last_reliable_bpm_time = 0.0
             signal = freqs = spec = None
