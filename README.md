@@ -32,9 +32,12 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-依赖见 [requirements.txt](requirements.txt)。
+依赖见 [requirements.txt](requirements.txt)。当前演示环境使用并锁定：
 
-当前代码已在 `opencv-python 4.6.0` 环境下兼容 YuNet `2022mar` 模型。较新的 OpenCV 版本通常也可以运行。
+- `opencv-python==4.6.0.66`
+- `numpy>=1.20`
+
+YuNet 默认使用 `face_detection_yunet_2022mar.onnx`，这是为了匹配当前已验证的 OpenCV 4.6 运行环境。较新的 OpenCV 版本可能也能运行，但本 demo 的依赖文件以当前实际验证版本为准。
 
 ## 运行
 
@@ -95,6 +98,8 @@ models/face_detection_yunet_2022mar.onnx
 ```
 
 如果 YuNet 初始化或运行失败，程序会自动回退到 Haar 检测器，避免 demo 直接崩溃。
+
+如果连续约 `1.5` 秒没有检测到人脸，程序会清空旧人脸框和信号缓存，BPM 与 confidence 会回到 `--`，避免人离开画面后继续用背景区域估算心率。
 
 ## 面板说明
 

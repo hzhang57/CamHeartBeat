@@ -17,6 +17,7 @@ TARGET_FS = 30.0
 MIN_ESTIMATE_SAMPLES = 90
 DETECTION_INTERVAL_S = 0.35
 ESTIMATE_INTERVAL_S = 0.35
+FACE_LOST_CLEAR_SECONDS = 1.5
 DEFAULT_YUNET_MODEL = Path(__file__).resolve().parent / "models" / "face_detection_yunet_2022mar.onnx"
 
 
@@ -179,7 +180,7 @@ def clamp_face_box(face, frame_shape):
     return (x1, y1, x2 - x1, y2 - y1)
 
 
-def detect_face_yunet(frame, detector_state, previous):
+def detect_face_yunet(frame, detector_state):
     frame_h, frame_w = frame.shape[:2]
     frame_size = (frame_w, frame_h)
     if detector_state.get("frame_size") != frame_size:
@@ -188,7 +189,7 @@ def detect_face_yunet(frame, detector_state, previous):
 
     _, faces = detector_state["model"].detect(frame)
     if faces is None or len(faces) == 0:
-        return previous
+        return None
 
     boxes = []
     for face in faces:
@@ -196,25 +197,25 @@ def detect_face_yunet(frame, detector_state, previous):
         box = clamp_face_box((int(round(x)), int(round(y)), int(round(w)), int(round(h))), frame.shape)
         if box is not None:
             boxes.append(box)
-    return choose_face(boxes, frame.shape) or previous
+    return choose_face(boxes, frame.shape)
 
 
-def detect_face_haar(frame, detector_state, previous):
+def detect_face_haar(frame, detector_state):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     faces = detector_state["model"].detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(90, 90))
-    return choose_face(faces, gray.shape) or previous
+    return choose_face(faces, gray.shape)
 
 
-def detect_face(frame, detector_state, previous):
+def detect_face(frame, detector_state):
     if detector_state["kind"] == "yunet":
         try:
-            return detect_face_yunet(frame, detector_state, previous)
+            return detect_face_yunet(frame, detector_state)
         except cv2.error as exc:
             print(f"YuNet detect failed ({exc}); switching to Haar.")
             detector_state.clear()
             detector_state.update(load_haar_detector())
-            return detect_face_haar(frame, detector_state, previous)
-    return detect_face_haar(frame, detector_state, previous)
+            return detect_face_haar(frame, detector_state)
+    return detect_face_haar(frame, detector_state)
 
 
 def smooth_face_box(previous, detected, alpha=0.25):
@@ -263,6 +264,12 @@ def mean_rgb(frame_bgr, mask):
         return None
     rgb = pixels[:, ::-1]
     return np.mean(rgb, axis=0)
+
+
+def clear_signal_state(rgb_history, time_history):
+    rgb_history.clear()
+    time_history.clear()
+    return None, None, None, None, None
 
 
 def draw_plot(canvas, x, y, w, h, values, color, label, vline=None):
@@ -386,6 +393,7 @@ def main():
     previous_face = None
     displayed_face = None
     last_detection = 0.0
+    last_face_seen_time = 0.0
     last_t = time.perf_counter()
     fps_smooth = 0.0
     displayed_bpm = None
@@ -410,8 +418,21 @@ def main():
 
         frame = cv2.flip(frame, 1)
         if now - last_detection > DETECTION_INTERVAL_S:
-            previous_face = detect_face(frame, detector, previous_face)
+            detected_face = detect_face(frame, detector)
+            if detected_face is not None:
+                previous_face = detected_face
+                last_face_seen_time = now
             last_detection = now
+
+        if previous_face is not None and now - last_face_seen_time > FACE_LOST_CLEAR_SECONDS:
+            previous_face = None
+            displayed_face = None
+            displayed_bpm, displayed_confidence, signal, freqs, spec = clear_signal_state(
+                rgb_history, time_history
+            )
+            last_reliable_bpm_time = 0.0
+            last_estimate = now
+
         displayed_face = smooth_face_box(displayed_face, previous_face)
 
         mask, roi_rects = roi_mask_for_face(frame.shape, displayed_face)
@@ -460,12 +481,10 @@ def main():
         elif key == ord("c"):
             method = "chrom"
         elif key == ord("r"):
-            rgb_history.clear()
-            time_history.clear()
-            displayed_bpm = None
-            displayed_confidence = None
+            displayed_bpm, displayed_confidence, signal, freqs, spec = clear_signal_state(
+                rgb_history, time_history
+            )
             last_reliable_bpm_time = 0.0
-            signal = freqs = spec = None
         elif key in (ord("+"), ord("=")):
             window_seconds = min(30.0, window_seconds + 1.0)
         elif key in (ord("-"), ord("_")):
