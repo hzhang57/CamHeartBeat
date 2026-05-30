@@ -1,0 +1,4 @@
+open-rppg
+setuptools<81
+opencv-python
+numpy

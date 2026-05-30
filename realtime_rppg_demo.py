@@ -18,6 +18,11 @@ MIN_ESTIMATE_SAMPLES = 90
 DETECTION_INTERVAL_S = 0.35
 ESTIMATE_INTERVAL_S = 0.35
 FACE_LOST_CLEAR_SECONDS = 1.5
+POS_WINDOW_SECONDS = 1.6
+POS_STEP_SECONDS = 0.1
+CHROM_WINDOW_SECONDS = 1.6
+CHROM_STEP_SECONDS = 0.1
+RPPG_METHODS = ("pos", "chrom")
 DEFAULT_YUNET_MODEL = Path(__file__).resolve().parent / "models" / "face_detection_yunet_2022mar.onnx"
 
 
@@ -71,7 +76,38 @@ def normalize_rgb(rgb):
     return c / (np.mean(c, axis=0, keepdims=True) + 1e-8) - 1.0
 
 
-def pos_signal(rgb):
+def pos_signal(rgb, fs, win_seconds=POS_WINDOW_SECONDS, step_seconds=POS_STEP_SECONDS):
+    rgb = np.asarray(rgb, dtype=np.float64)
+    n = len(rgb)
+    win = max(8, int(round(win_seconds * fs)))
+    if n < win:
+        return pos_signal_segment(rgb)
+    step = max(1, int(round(step_seconds * fs)))
+
+    pulse = np.zeros(n, dtype=np.float64)
+    counts = np.zeros(n, dtype=np.float64)
+
+    for start in range(0, n - win + 1, step):
+        stop = start + win
+        segment = pos_signal_segment(rgb[start:stop])
+        segment = segment - np.mean(segment)
+        pulse[start:stop] += segment
+        counts[start:stop] += 1.0
+
+    if counts[-1] == 0:
+        start = n - win
+        stop = n
+        segment = pos_signal_segment(rgb[start:stop])
+        segment = segment - np.mean(segment)
+        pulse[start:stop] += segment
+        counts[start:stop] += 1.0
+
+    valid = counts > 0
+    pulse[valid] /= counts[valid]
+    return pulse
+
+
+def pos_signal_segment(rgb):
     c = normalize_rgb(rgb).T
     h = np.array([[0.0, 1.0, -1.0], [-2.0, 1.0, 1.0]]) @ c
     std0 = np.std(h[0]) + 1e-8
@@ -79,24 +115,53 @@ def pos_signal(rgb):
     return h[0] + (std0 / std1) * h[1]
 
 
-def chrom_signal(rgb):
+def chrom_signal(rgb, fs, win_seconds=CHROM_WINDOW_SECONDS, step_seconds=CHROM_STEP_SECONDS):
+    rgb = np.asarray(rgb, dtype=np.float64)
+    n = len(rgb)
+    win = max(8, int(round(win_seconds * fs)))
+    if n < win:
+        return chrom_signal_segment(rgb, fs)
+    step = max(1, int(round(step_seconds * fs)))
+
+    pulse = np.zeros(n, dtype=np.float64)
+    counts = np.zeros(n, dtype=np.float64)
+
+    for start in range(0, n - win + 1, step):
+        stop = start + win
+        segment = chrom_signal_segment(rgb[start:stop], fs)
+        segment = segment - np.mean(segment)
+        pulse[start:stop] += segment
+        counts[start:stop] += 1.0
+
+    if counts[-1] == 0:
+        start = n - win
+        stop = n
+        segment = chrom_signal_segment(rgb[start:stop], fs)
+        segment = segment - np.mean(segment)
+        pulse[start:stop] += segment
+        counts[start:stop] += 1.0
+
+    valid = counts > 0
+    pulse[valid] /= counts[valid]
+    return pulse
+
+
+def chrom_signal_segment(rgb, fs):
     c = normalize_rgb(rgb)
     r, g, b = c[:, 0], c[:, 1], c[:, 2]
     x = 3.0 * r - 2.0 * g
     y = 1.5 * r + g - 1.5 * b
-    alpha = (np.std(x) + 1e-8) / (np.std(y) + 1e-8)
-    return x - alpha * y
+    x_filtered = bandpass_fft(x, fs, HR_MIN_HZ, HR_MAX_HZ)
+    y_filtered = bandpass_fft(y, fs, HR_MIN_HZ, HR_MAX_HZ)
+    alpha = (np.std(x_filtered) + 1e-8) / (np.std(y_filtered) + 1e-8)
+    return x_filtered - alpha * y_filtered
 
 
-def estimate_hr(times, rgb, method):
-    if len(rgb) < MIN_ESTIMATE_SAMPLES:
-        return None, None, None, None, 0.0
-
-    samples, fs = uniform_resample(times, rgb, target_fs=TARGET_FS)
+def estimate_hr_from_samples(samples, fs, method):
     if len(samples) < MIN_ESTIMATE_SAMPLES:
         return None, None, None, None, 0.0
 
-    raw = pos_signal(samples) if method == "pos" else chrom_signal(samples)
+    raw = pos_signal(samples, fs) if method == "pos" else chrom_signal(samples, fs)
     filtered = bandpass_fft(raw, fs, HR_MIN_HZ, HR_MAX_HZ)
 
     freqs = np.fft.rfftfreq(len(filtered), d=1.0 / fs)
@@ -116,6 +181,17 @@ def estimate_hr(times, rgb, method):
     noise_power = float(np.sum(band_spec[~peak_mask]) + 1e-8)
     confidence = np.clip(peak_power / noise_power, 0.0, 5.0) / 5.0
     return filtered, freqs, spec, bpm, float(confidence)
+
+
+def estimate_hr(times, rgb, method):
+    if len(rgb) < MIN_ESTIMATE_SAMPLES:
+        return None, None, None, None, 0.0
+
+    samples, fs = uniform_resample(times, rgb, target_fs=TARGET_FS)
+    if len(samples) < MIN_ESTIMATE_SAMPLES:
+        return None, None, None, None, 0.0
+
+    return estimate_hr_from_samples(samples, fs, method)
 
 
 def load_haar_detector():
@@ -266,10 +342,40 @@ def mean_rgb(frame_bgr, mask):
     return np.mean(rgb, axis=0)
 
 
+def empty_display_results():
+    return {
+        method: {
+            "bpm": None,
+            "confidence": None,
+            "last_reliable_time": 0.0,
+            "raw_bpm": None,
+            "raw_confidence": None,
+        }
+        for method in RPPG_METHODS
+    }
+
+
+def empty_signal_results():
+    return {method: {"signal": None, "freqs": None, "spec": None} for method in RPPG_METHODS}
+
+
 def clear_signal_state(rgb_history, time_history):
     rgb_history.clear()
     time_history.clear()
-    return None, None, None, None, None
+    return empty_display_results(), empty_signal_results()
+
+
+def update_display_result(display_results, method, bpm, confidence, now):
+    result = display_results[method]
+    result["raw_bpm"] = bpm
+    result["raw_confidence"] = confidence
+    if bpm is not None and confidence >= MIN_DISPLAY_CONFIDENCE:
+        result["bpm"] = bpm
+        result["confidence"] = confidence
+        result["last_reliable_time"] = now
+    elif now - result["last_reliable_time"] > DISPLAY_HOLD_SECONDS:
+        result["bpm"] = None
+        result["confidence"] = None
 
 
 def draw_plot(canvas, x, y, w, h, values, color, label, vline=None):
@@ -295,7 +401,55 @@ def draw_plot(canvas, x, y, w, h, values, color, label, vline=None):
         cv2.line(canvas, (vx, y), (vx, y + h), (150, 150, 150), 1)
 
 
-def draw_dashboard(frame, face, roi_rects, method, bpm, confidence, signal, freqs, spec, fps, window_seconds):
+def draw_bpm_row(canvas, x, y, label, result, color):
+    bpm = result["bpm"]
+    confidence = result["confidence"]
+    bpm_text = "--" if bpm is None else f"{bpm:5.1f}"
+    conf = 0.0 if confidence is None else confidence
+    conf_text = "--" if confidence is None else f"{confidence:0.2f}"
+
+    cv2.putText(canvas, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (210, 210, 210), 1)
+    cv2.putText(canvas, bpm_text, (x + 92, y + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.35, color, 3)
+    cv2.putText(canvas, "BPM", (x + 245, y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 210, 210), 1)
+    cv2.putText(
+        canvas,
+        f"Conf: {conf_text}",
+        (x, y + 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (185, 190, 198),
+        1,
+    )
+    cv2.rectangle(canvas, (x + 92, y + 25), (x + 280, y + 38), (70, 70, 70), 1)
+    cv2.rectangle(canvas, (x + 92, y + 25), (x + 92 + int(188 * conf), y + 38), color, -1)
+
+
+def draw_raw_result(canvas, x, y, label, result):
+    raw_bpm = result["raw_bpm"]
+    raw_confidence = result["raw_confidence"]
+    bpm_text = "--" if raw_bpm is None else f"{raw_bpm:5.1f}"
+    conf_text = "--" if raw_confidence is None else f"{raw_confidence:0.2f}"
+    cv2.putText(
+        canvas,
+        f"raw {label}: {bpm_text} BPM  conf {conf_text}",
+        (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (150, 155, 164),
+        1,
+    )
+
+
+def draw_dashboard(
+    frame,
+    face,
+    roi_rects,
+    method,
+    display_results,
+    selected_signal,
+    fps,
+    window_seconds,
+):
     frame_h, frame_w = frame.shape[:2]
     panel_w = 420
     canvas_h = max(frame_h, 720)
@@ -321,30 +475,29 @@ def draw_dashboard(frame, face, roi_rects, method, bpm, confidence, signal, freq
     for i, line in enumerate(info_lines):
         cv2.putText(canvas, line, (px, 78 + i * 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (190, 205, 220), 1)
 
-    bpm_text = "--" if bpm is None else f"{bpm:5.1f}"
-    cv2.putText(canvas, bpm_text, (px, 210), cv2.FONT_HERSHEY_SIMPLEX, 2.4, (80, 220, 140), 4)
-    cv2.putText(canvas, "BPM", (px + 230, 205), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (210, 210, 210), 2)
-
-    conf = 0.0 if confidence is None else confidence
-    conf_text = "--" if confidence is None else f"{confidence:0.2f}"
     cv2.putText(
         canvas,
-        f"Confidence: {conf_text}  min {MIN_DISPLAY_CONFIDENCE:0.2f}",
-        (px, 245),
+        f"BPM confidence min {MIN_DISPLAY_CONFIDENCE:0.2f}",
+        (px, 156),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (210, 210, 210),
+        0.48,
+        (165, 170, 178),
         1,
     )
-    cv2.rectangle(canvas, (px, 260), (px + 240, 276), (70, 70, 70), 1)
-    cv2.rectangle(canvas, (px, 260), (px + int(240 * conf), 276), (80, 180, 120), -1)
+    draw_bpm_row(canvas, px, 192, "POS", display_results["pos"], (80, 220, 140))
+    draw_bpm_row(canvas, px, 264, "CHROM", display_results["chrom"], (90, 210, 250))
+    draw_raw_result(canvas, px, 330, "CHROM", display_results["chrom"])
 
     plot_w = panel_w - 48
     plot_h = 82
-    wave_y = 325
+    wave_y = 385
     spec_y = wave_y + plot_h + 58
     help_y = spec_y + plot_h + 44
-    draw_plot(canvas, px, wave_y, plot_w, plot_h, signal, (90, 210, 250), "rPPG waveform")
+    signal = selected_signal["signal"]
+    freqs = selected_signal["freqs"]
+    spec = selected_signal["spec"]
+    selected_bpm = display_results[method]["bpm"]
+    draw_plot(canvas, px, wave_y, plot_w, plot_h, signal, (90, 210, 250), f"{method.upper()} waveform")
 
     spectrum_values = None
     peak_line = None
@@ -352,14 +505,14 @@ def draw_dashboard(frame, face, roi_rects, method, bpm, confidence, signal, freq
         mask = (freqs >= HR_MIN_HZ) & (freqs <= HR_MAX_HZ)
         if np.any(mask):
             spectrum_values = spec[mask]
-            if bpm is not None:
-                peak_hz = bpm / 60.0
+            if selected_bpm is not None:
+                peak_hz = selected_bpm / 60.0
                 peak_line = (peak_hz - HR_MIN_HZ) / (HR_MAX_HZ - HR_MIN_HZ)
     draw_plot(canvas, px, spec_y, plot_w, plot_h, spectrum_values, (120, 170, 255), "spectrum", peak_line)
 
     help_lines = [
         "q quit    r reset",
-        "p POS     c CHROM",
+        "p/c select plot",
         "+/- window size",
         "Keep face still and well lit.",
     ]
@@ -396,12 +549,8 @@ def main():
     last_face_seen_time = 0.0
     last_t = time.perf_counter()
     fps_smooth = 0.0
-    displayed_bpm = None
-    displayed_confidence = None
-    last_reliable_bpm_time = 0.0
-    signal = None
-    freqs = None
-    spec = None
+    display_results = empty_display_results()
+    signal_results = empty_signal_results()
     last_estimate = 0.0
 
     cv2.namedWindow("CPU rPPG Demo", cv2.WINDOW_NORMAL)
@@ -427,10 +576,7 @@ def main():
         if previous_face is not None and now - last_face_seen_time > FACE_LOST_CLEAR_SECONDS:
             previous_face = None
             displayed_face = None
-            displayed_bpm, displayed_confidence, signal, freqs, spec = clear_signal_state(
-                rgb_history, time_history
-            )
-            last_reliable_bpm_time = 0.0
+            display_results, signal_results = clear_signal_state(rgb_history, time_history)
             last_estimate = now
 
         displayed_face = smooth_face_box(displayed_face, previous_face)
@@ -446,16 +592,13 @@ def main():
             rgb_history.popleft()
 
         if len(rgb_history) >= MIN_ESTIMATE_SAMPLES and now - last_estimate >= ESTIMATE_INTERVAL_S:
-            signal, freqs, spec, bpm, confidence = estimate_hr(
-                np.array(time_history), np.array(rgb_history), method
-            )
-            if bpm is not None and confidence >= MIN_DISPLAY_CONFIDENCE:
-                displayed_bpm = bpm
-                displayed_confidence = confidence
-                last_reliable_bpm_time = now
-            elif now - last_reliable_bpm_time > DISPLAY_HOLD_SECONDS:
-                displayed_bpm = None
-                displayed_confidence = None
+            times = np.array(time_history)
+            rgbs = np.array(rgb_history)
+            samples, fs = uniform_resample(times, rgbs, target_fs=TARGET_FS)
+            for rppg_method in RPPG_METHODS:
+                signal, freqs, spec, bpm, confidence = estimate_hr_from_samples(samples, fs, rppg_method)
+                signal_results[rppg_method] = {"signal": signal, "freqs": freqs, "spec": spec}
+                update_display_result(display_results, rppg_method, bpm, confidence, now)
             last_estimate = now
 
         dashboard = draw_dashboard(
@@ -463,11 +606,8 @@ def main():
             displayed_face,
             roi_rects,
             method,
-            displayed_bpm,
-            displayed_confidence,
-            signal,
-            freqs,
-            spec,
+            display_results,
+            signal_results[method],
             fps_smooth,
             window_seconds,
         )
@@ -481,10 +621,7 @@ def main():
         elif key == ord("c"):
             method = "chrom"
         elif key == ord("r"):
-            displayed_bpm, displayed_confidence, signal, freqs, spec = clear_signal_state(
-                rgb_history, time_history
-            )
-            last_reliable_bpm_time = 0.0
+            display_results, signal_results = clear_signal_state(rgb_history, time_history)
         elif key in (ord("+"), ord("=")):
             window_seconds = min(30.0, window_seconds + 1.0)
         elif key in (ord("-"), ord("_")):
