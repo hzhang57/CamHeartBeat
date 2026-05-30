@@ -18,10 +18,8 @@ MIN_ESTIMATE_SAMPLES = 90
 DETECTION_INTERVAL_S = 0.35
 ESTIMATE_INTERVAL_S = 0.35
 FACE_LOST_CLEAR_SECONDS = 1.5
-POS_WINDOW_SECONDS = 1.6
-POS_STEP_SECONDS = 0.1
-CHROM_WINDOW_SECONDS = 1.6
-CHROM_STEP_SECONDS = 0.1
+RPPG_WINDOW_SECONDS = 1.6
+RPPG_STEP_SECONDS = 0.1
 RPPG_METHODS = ("pos", "chrom")
 DEFAULT_YUNET_MODEL = Path(__file__).resolve().parent / "models" / "face_detection_yunet_2022mar.onnx"
 
@@ -76,12 +74,12 @@ def normalize_rgb(rgb):
     return c / (np.mean(c, axis=0, keepdims=True) + 1e-8) - 1.0
 
 
-def pos_signal(rgb, fs, win_seconds=POS_WINDOW_SECONDS, step_seconds=POS_STEP_SECONDS):
+def overlap_add_signal(rgb, fs, segment_fn, win_seconds=RPPG_WINDOW_SECONDS, step_seconds=RPPG_STEP_SECONDS):
     rgb = np.asarray(rgb, dtype=np.float64)
     n = len(rgb)
     win = max(8, int(round(win_seconds * fs)))
     if n < win:
-        return pos_signal_segment(rgb)
+        return segment_fn(rgb)
     step = max(1, int(round(step_seconds * fs)))
 
     pulse = np.zeros(n, dtype=np.float64)
@@ -89,7 +87,7 @@ def pos_signal(rgb, fs, win_seconds=POS_WINDOW_SECONDS, step_seconds=POS_STEP_SE
 
     for start in range(0, n - win + 1, step):
         stop = start + win
-        segment = pos_signal_segment(rgb[start:stop])
+        segment = segment_fn(rgb[start:stop])
         segment = segment - np.mean(segment)
         pulse[start:stop] += segment
         counts[start:stop] += 1.0
@@ -97,7 +95,7 @@ def pos_signal(rgb, fs, win_seconds=POS_WINDOW_SECONDS, step_seconds=POS_STEP_SE
     if counts[-1] == 0:
         start = n - win
         stop = n
-        segment = pos_signal_segment(rgb[start:stop])
+        segment = segment_fn(rgb[start:stop])
         segment = segment - np.mean(segment)
         pulse[start:stop] += segment
         counts[start:stop] += 1.0
@@ -105,6 +103,10 @@ def pos_signal(rgb, fs, win_seconds=POS_WINDOW_SECONDS, step_seconds=POS_STEP_SE
     valid = counts > 0
     pulse[valid] /= counts[valid]
     return pulse
+
+
+def pos_signal(rgb, fs):
+    return overlap_add_signal(rgb, fs, pos_signal_segment)
 
 
 def pos_signal_segment(rgb):
@@ -115,35 +117,8 @@ def pos_signal_segment(rgb):
     return h[0] + (std0 / std1) * h[1]
 
 
-def chrom_signal(rgb, fs, win_seconds=CHROM_WINDOW_SECONDS, step_seconds=CHROM_STEP_SECONDS):
-    rgb = np.asarray(rgb, dtype=np.float64)
-    n = len(rgb)
-    win = max(8, int(round(win_seconds * fs)))
-    if n < win:
-        return chrom_signal_segment(rgb, fs)
-    step = max(1, int(round(step_seconds * fs)))
-
-    pulse = np.zeros(n, dtype=np.float64)
-    counts = np.zeros(n, dtype=np.float64)
-
-    for start in range(0, n - win + 1, step):
-        stop = start + win
-        segment = chrom_signal_segment(rgb[start:stop], fs)
-        segment = segment - np.mean(segment)
-        pulse[start:stop] += segment
-        counts[start:stop] += 1.0
-
-    if counts[-1] == 0:
-        start = n - win
-        stop = n
-        segment = chrom_signal_segment(rgb[start:stop], fs)
-        segment = segment - np.mean(segment)
-        pulse[start:stop] += segment
-        counts[start:stop] += 1.0
-
-    valid = counts > 0
-    pulse[valid] /= counts[valid]
-    return pulse
+def chrom_signal(rgb, fs):
+    return overlap_add_signal(rgb, fs, lambda segment: chrom_signal_segment(segment, fs))
 
 
 def chrom_signal_segment(rgb, fs):
@@ -181,17 +156,6 @@ def estimate_hr_from_samples(samples, fs, method):
     noise_power = float(np.sum(band_spec[~peak_mask]) + 1e-8)
     confidence = np.clip(peak_power / noise_power, 0.0, 5.0) / 5.0
     return filtered, freqs, spec, bpm, float(confidence)
-
-
-def estimate_hr(times, rgb, method):
-    if len(rgb) < MIN_ESTIMATE_SAMPLES:
-        return None, None, None, None, 0.0
-
-    samples, fs = uniform_resample(times, rgb, target_fs=TARGET_FS)
-    if len(samples) < MIN_ESTIMATE_SAMPLES:
-        return None, None, None, None, 0.0
-
-    return estimate_hr_from_samples(samples, fs, method)
 
 
 def load_haar_detector():

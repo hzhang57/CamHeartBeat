@@ -122,6 +122,21 @@ python deep_rppg_demo.py --model EfficientPhys.rlap
 
 深度 demo 会显示摄像头画面、人脸框、`Deep BPM`、`SQI`、模型名、FPS 和推理延迟。BPM 每秒更新一次；如果模型缓冲不足、没有检测到可靠结果，或 SQI 低于阈值，会显示 `--`。
 
+### POS / 深度模型对比 Demo
+
+对比 demo 使用同一路 open-rppg 摄像头预览，同时计算传统 `POS` 和深度模型心率，并在同一个面板里显示两者、质量分数、差值和 POS 波形/频谱：
+
+```bash
+python bench_rppg_demo.py
+```
+
+常用参数：
+
+```bash
+python bench_rppg_demo.py --model FacePhys.rlap --window 12 --hr-window 10
+python bench_rppg_demo.py --min-confidence 0.05 --min-sqi 0.20
+```
+
 ## 参数
 
 | 参数 | 默认值 | 说明 |
@@ -188,6 +203,7 @@ BPM confidence 阈值为 `0.20`：
 .
 ├── realtime_rppg_demo.py
 ├── deep_rppg_demo.py
+├── bench_rppg_demo.py
 ├── requirements.txt
 ├── requirements-deep.txt
 ├── models/
