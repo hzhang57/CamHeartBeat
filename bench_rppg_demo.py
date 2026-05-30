@@ -6,7 +6,7 @@ from collections import deque
 import cv2
 import numpy as np
 
-from deep_rppg_demo import draw_face_box, import_rppg, normalize_frame, parse_hr_result, reliable_result
+from deep_rppg_demo import draw_face_box, import_rppg, normalize_frame, parse_hr_result
 from realtime_rppg_demo import (
     DISPLAY_HOLD_SECONDS,
     ESTIMATE_INTERVAL_S,
